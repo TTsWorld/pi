@@ -1,3 +1,16 @@
+/**
+ * @file 跨 provider 消息改写（上下文接力）
+ * @description 在把历史消息发给目标模型前做兼容性改写，解决「会话中途换模型」的问题：
+ *              - 非视觉模型的图片降级为占位符文本（相邻图片合并为一个占位）
+ *              - thinking 块：同模型保留（含回放签名），跨模型转为纯文本、redacted 丢弃
+ *              - 工具调用：跨模型时剥掉 provider 专属签名、按需归一化 ID（OpenAI 的
+ *                450+ 字符特殊字符 ID 过不了 Anthropic 的 ^[a-zA-Z0-9_-]+$ 校验）
+ *              - 孤儿工具调用（无对应结果）补合成错误结果；error/aborted 的助手回合整条跳过
+ *
+ * 依赖关系：
+ * - ../types.ts 的消息/模型类型；被各 API 实现在发送前调用
+ */
+
 import type {
 	Api,
 	AssistantMessage,
@@ -9,9 +22,14 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 
+// 非视觉模型的图片占位文案（用户消息与工具结果分别措辞）
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
 
+/**
+ * 把图片块替换为占位文本块；连续多个图片只保留一个占位（避免占位刷屏），
+ * 且「与占位文案相同的文本块」后紧跟图片时也不重复插入。
+ */
 function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], placeholder: string): TextContent[] {
 	const result: TextContent[] = [];
 	let previousWasPlaceholder = false;
@@ -32,6 +50,7 @@ function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], p
 	return result;
 }
 
+/** 模型不支持图片输入时，把用户消息与工具结果中的图片降级为占位文本 */
 function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model: Model<TApi>): Message[] {
 	if (model.input.includes("image")) {
 		return messages;
@@ -57,30 +76,35 @@ function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model
 }
 
 /**
- * Normalize tool call ID for cross-provider compatibility.
- * OpenAI Responses API generates IDs that are 450+ chars with special characters like `|`.
- * Anthropic APIs require IDs matching ^[a-zA-Z0-9_-]+$ (max 64 chars).
+ * 为跨 provider 兼容性改写消息历史（上下文接力的核心）。
+ * 归一化工具调用 ID：OpenAI Responses API 生成 450+ 字符、含 `|` 等特殊字符的 ID，
+ * 而 Anthropic API 要求 ID 匹配 ^[a-zA-Z0-9_-]+$（最长 64 字符）。
+ *
+ * @param messages 原始历史消息
+ * @param model 即将接收这些消息的目标模型
+ * @param normalizeToolCallId 可选的 ID 归一化钩子（跨模型时才调用），各 API 自带规则
+ * @returns 改写后的消息（两遍处理：内容改写 → 孤儿工具调用补结果）
  */
 export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
 ): Message[] {
-	// Build a map of original tool call IDs to normalized IDs
+	// 原始工具调用 ID → 归一化 ID 的映射（第一遍记录，供第二遍改写工具结果的引用）
 	const toolCallIdMap = new Map<string, string>();
-	// Normalize null/undefined content from untyped callers (custom tools, hand-built
-	// histories, old session files) so downstream code can rely on the type contract.
+	// 归一化 untyped 调用方（自定义工具、手搓历史、旧会话文件）带来的 null/undefined
+	// content，让下游代码可以信赖类型契约
 	const normalizedMessages = messages.map((msg) => (msg.content == null ? { ...msg, content: [] } : msg));
 	const imageAwareMessages = downgradeUnsupportedImages(normalizedMessages, model);
 
-	// First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
+	// ========== 第一遍：内容改写（图片降级、thinking 块、工具调用 ID 归一化） ==========
 	const transformed = imageAwareMessages.map((msg) => {
-		// User messages pass through unchanged
+		// 用户消息原样通过（图片降级已在此前完成）
 		if (msg.role === "user") {
 			return msg;
 		}
 
-		// Handle toolResult messages - normalize toolCallId if we have a mapping
+		// 工具结果消息：若有 ID 映射则改写 toolCallId，保持调用与结果配对
 		if (msg.role === "toolResult") {
 			const normalizedId = toolCallIdMap.get(msg.toolCallId);
 			if (normalizedId && normalizedId !== msg.toolCallId) {
@@ -89,9 +113,10 @@ export function transformMessages<TApi extends Api>(
 			return msg;
 		}
 
-		// Assistant messages need transformation check
+		// 助手消息：按「是否同模型」分派各内容块的改写策略
 		if (msg.role === "assistant") {
 			const assistantMsg = msg as AssistantMessage;
+			// 同模型 = provider/api/model 三元组一致，可原样回放 provider 专属数据
 			const isSameModel =
 				assistantMsg.provider === model.provider &&
 				assistantMsg.api === model.api &&
@@ -99,15 +124,15 @@ export function transformMessages<TApi extends Api>(
 
 			const transformedContent = assistantMsg.content.flatMap((block) => {
 				if (block.type === "thinking") {
-					// Redacted thinking is opaque encrypted content, only valid for the same model.
-					// Drop it for cross-model to avoid API errors.
+					// redacted thinking 是不透明的加密内容，只有原模型能解；
+					// 跨模型发送会触发 API 错误，直接丢弃
 					if (block.redacted) {
 						return isSameModel ? block : [];
 					}
-					// For same model: keep thinking blocks with signatures (needed for replay)
-					// even if the thinking text is empty (OpenAI encrypted reasoning)
+					// 同模型：保留带签名的 thinking 块（回放必需），
+					// 即使思考文本为空（OpenAI 加密 reasoning 只有签名）
 					if (isSameModel && block.thinkingSignature) return block;
-					// Skip empty thinking blocks, convert others to plain text
+					// 空思考块跳过；其余跨模型的转为纯文本（保留思路信息量）
 					if (!block.thinking || block.thinking.trim() === "") return [];
 					if (isSameModel) return block;
 					return {
@@ -117,6 +142,7 @@ export function transformMessages<TApi extends Api>(
 				}
 
 				if (block.type === "text") {
+					// 文本块本身通用；跨模型时重建为纯文本块以剥离可能携带的额外字段
 					if (isSameModel) return block;
 					return {
 						type: "text" as const,
@@ -128,11 +154,13 @@ export function transformMessages<TApi extends Api>(
 					const toolCall = block as ToolCall;
 					let normalizedToolCall: ToolCall = toolCall;
 
+					// 跨模型剥掉 provider 专属的 thoughtSignature（目标模型无法解读）
 					if (!isSameModel && toolCall.thoughtSignature) {
 						normalizedToolCall = { ...toolCall };
 						delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
 					}
 
+					// 跨模型归一化 ID（如压短 OpenAI 超长 ID），并记录映射供工具结果改写
 					if (!isSameModel && normalizeToolCallId) {
 						const normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
 						if (normalizedId !== toolCall.id) {
@@ -155,14 +183,15 @@ export function transformMessages<TApi extends Api>(
 		return msg;
 	});
 
-	// Second pass: insert synthetic empty tool results for orphaned tool calls
-	// This preserves thinking signatures and satisfies API requirements
+	// ========== 第二遍：为孤儿工具调用补合成结果 ==========
+	// 保留思考签名的同时满足「每个工具调用必须有结果」的 API 硬性要求
 	const result: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
 	const insertSyntheticToolResults = () => {
 		if (pendingToolCalls.length > 0) {
 			for (const tc of pendingToolCalls) {
+				// 只补真正缺失结果的调用；已有结果的保持配对
 				if (!existingToolResultIds.has(tc.id)) {
 					result.push({
 						role: "toolResult",
@@ -183,20 +212,19 @@ export function transformMessages<TApi extends Api>(
 		const msg = transformed[i];
 
 		if (msg.role === "assistant") {
-			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
+			// 上一条助手消息还有未配对的调用：先补齐合成结果再继续
 			insertSyntheticToolResults();
 
-			// Skip errored/aborted assistant messages entirely.
-			// These are incomplete turns that shouldn't be replayed:
-			// - May have partial content (reasoning without message, incomplete tool calls)
-			// - Replaying them can cause API errors (e.g., OpenAI "reasoning without following item")
-			// - The model should retry from the last valid state
+			// error/aborted 的助手消息整条跳过——它们是不完整回合，不该回放：
+			// - 可能有残缺内容（只有 reasoning 没有消息、不完整的工具调用）
+			// - 回放会触发 API 错误（如 OpenAI 的 "reasoning without following item"）
+			// - 模型应从最后一个有效状态重试
 			const assistantMsg = msg as AssistantMessage;
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
 				continue;
 			}
 
-			// Track tool calls from this assistant message
+			// 记录本条助手消息的工具调用，等待后续结果配对
 			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
 			if (toolCalls.length > 0) {
 				pendingToolCalls = toolCalls;
@@ -208,7 +236,7 @@ export function transformMessages<TApi extends Api>(
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "user") {
-			// User message interrupts tool flow - insert synthetic results for orphaned calls
+			// 用户消息打断工具流：为悬空的调用补合成结果
 			insertSyntheticToolResults();
 			result.push(msg);
 		} else {
@@ -216,7 +244,7 @@ export function transformMessages<TApi extends Api>(
 		}
 	}
 
-	// If the conversation ends with unresolved tool calls, synthesize results now.
+	// 会话以未解决的工具调用收尾时，在此补齐
 	insertSyntheticToolResults();
 
 	return result;
