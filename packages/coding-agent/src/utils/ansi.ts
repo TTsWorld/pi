@@ -26,14 +26,28 @@
  * SOFTWARE.
  */
 
+/**
+ * @file ansi.ts —— ANSI 转义序列识别与剥离
+ *
+ * @description
+ * 移植自 ansi-regex / strip-ansi（MIT，版权声明见上），
+ * 提供 `stripAnsi` 从终端输出中去除颜色等 ANSI 转义序列，得到纯文本。
+ */
+
+/**
+ * 构造匹配 ANSI 转义序列的正则。
+ *
+ * @param options.onlyFirst - 为 true 时正则不带 g 标志（只匹配第一个）
+ * @returns 匹配 OSC 或 CSI 转义序列的正则
+ */
 function ansiRegex({ onlyFirst = false }: { onlyFirst?: boolean } = {}): RegExp {
-	// Valid string terminator sequences are BEL, ESC\, and 0x9c
+	// 有效的字符串终结符（ST）序列：BEL、ESC\ 以及 0x9c
 	const ST = "(?:\\u0007|\\u001B\\u005C|\\u009C)";
 
-	// OSC sequences only: ESC ] ... ST (non-greedy until the first ST)
+	// 仅 OSC 序列：ESC ] ... ST（非贪婪，匹配到第一个 ST 为止）
 	const osc = `(?:\\u001B\\][\\s\\S]*?${ST})`;
 
-	// CSI and related: ESC/C1, optional intermediates, optional params (supports ; and :) then final byte
+	// CSI 及相关序列：ESC/C1 引导 + 可选中间字节 + 可选参数（支持 ; 和 :）+ 终止字节
 	const csi = "[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]";
 
 	const pattern = `${osc}|${csi}`;
@@ -43,18 +57,24 @@ function ansiRegex({ onlyFirst = false }: { onlyFirst?: boolean } = {}): RegExp 
 
 const regex = ansiRegex();
 
+/**
+ * 去除字符串中的所有 ANSI 转义序列。
+ *
+ * @param value - 待清理的字符串
+ * @returns 不含 ANSI 转义序列的纯文本
+ * @throws 入参不是字符串时抛出 TypeError
+ */
 export function stripAnsi(value: string): string {
 	if (typeof value !== "string") {
 		throw new TypeError(`Expected a \`string\`, got \`${typeof value}\``);
 	}
 
-	// Fast path: ANSI codes require ESC (7-bit) or CSI (8-bit) introducer
+	// 快速路径：ANSI 码必然包含 ESC（7 位）或 CSI（8 位）引导符，都不含则直接返回
 	if (!value.includes("\u001B") && !value.includes("\u009B")) {
 		return value;
 	}
 
-	// Even though the regex is global, we don't need to reset the `.lastIndex`
-	// because unlike `.exec()` and `.test()`, `.replace()` does it automatically
-	// and doing it manually has a performance penalty.
+	// 虽然正则是全局的，但无需手动重置 `.lastIndex`：
+	// 与 `.exec()` 和 `.test()` 不同，`.replace()` 会自动重置，手动做反而有性能损耗。
 	return value.replace(regex, "");
 }

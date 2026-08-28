@@ -1,5 +1,23 @@
 /**
- * CLI argument parsing and help display
+ * @file args.ts —— CLI 命令行参数解析与帮助信息展示
+ *
+ * @description
+ * 本文件是 coding-agent CLI 的参数入口层：核心 {@link parseArgs} 把原始参数
+ * 数组解析为结构化的 {@link Args} 供后续启动流程使用；{@link printHelp}
+ * 负责输出完整的帮助文本（含扩展注册的自定义 flag）。
+ *
+ * 主要功能点：
+ * - 手写的逐 token 解析循环（不依赖通用参数解析库），以便把未识别的长选项
+ *   收集进 `unknownFlags` 透传给扩展系统（扩展可注册自己的 CLI flag）；
+ * - 支持的参数形态：`--flag value`、`--flag=value`、`@file` 文件引用、
+ *   `--` 之后全部视为消息/文件、以及 `-p` 后可选的内联 prompt；
+ * - 解析过程中的可恢复问题（非法枚举值、选项缺值）不直接抛错，而是记录到
+ *   `diagnostics`，由调用方统一决定如何提示用户。
+ *
+ * 依赖关系：
+ * - `@earendil-works/pi-agent-core`：ThinkingLevel 思考级别类型；
+ * - `../config.ts`：应用名、配置目录名等常量（帮助文本中引用）；
+ * - `../core/extensions/types.ts` / `../core/settings-manager.ts`：仅类型引用。
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -8,8 +26,15 @@ import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../co
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import type { TuiMode } from "../core/settings-manager.ts";
 
+/** CLI 运行模式：text 为常规交互（默认），json 为逐行 JSON 事件输出，rpc 为 RPC 服务模式 */
 export type Mode = "text" | "json" | "rpc";
 
+/**
+ * parseArgs 的解析结果。
+ *
+ * 除四个收集型字段（messages / fileArgs / unknownFlags / diagnostics）外，
+ * 其余字段与同名 CLI 选项一一对应，undefined 即表示该选项未在命令行出现。
+ */
 export interface Args {
 	provider?: string;
 	model?: string;
@@ -17,7 +42,9 @@ export interface Args {
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
+	/** 续接当前项目最近一次会话（--continue） */
 	continue?: boolean;
+	/** 打开会话选择列表，从历史会话中恢复（--resume） */
 	resume?: boolean;
 	help?: boolean;
 	version?: boolean;
@@ -35,6 +62,7 @@ export interface Args {
 	noBuiltinTools?: boolean;
 	extensions?: string[];
 	noExtensions?: boolean;
+	/** 非交互模式（--print/-p）：处理完初始 prompt 后直接退出 */
 	print?: boolean;
 	export?: string;
 	noSkills?: boolean;
@@ -45,30 +73,63 @@ export interface Args {
 	useTheme?: string;
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	/** 列出可用模型；值为模糊搜索串，未带参数时为 true */
 	listModels?: string | true;
 	offline?: boolean;
 	tuiMode?: TuiMode;
 	verbose?: boolean;
+	/** 三态覆盖项目信任：true=本次信任项目本地文件，false=本次忽略，undefined=沿用既有设置 */
 	projectTrustOverride?: boolean;
+	/** 位置参数中的消息文本，按出现顺序拼接为初始 prompt */
 	messages: string[];
+	/** @file 引用的文件路径（已去掉 @ 前缀），作为附件并入初始消息 */
 	fileArgs: string[];
-	/** Unknown flags (potentially extension flags) - map of flag name to value */
+	/** 未知 flag（可能是扩展注册的 flag）——flag 名到值的映射 */
 	unknownFlags: Map<string, boolean | string>;
+	/** 解析过程中发现的可恢复问题，由调用方统一决定如何呈现给用户 */
 	diagnostics: Array<{ type: "warning" | "error"; message: string }>;
 }
 
+/** --thinking 选项的合法取值白名单（与 pi-agent-core 的 ThinkingLevel 取值一一对应） */
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
+/**
+ * 类型守卫：判断字符串是否为合法的思考级别。
+ *
+ * @param level - 待校验的字符串（来自命令行）
+ * @returns 为 true 时可收窄为 ThinkingLevel 类型
+ */
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
 }
 
+/**
+ * 归一化会话名：去掉首尾空白；全空白视为未提供返回 undefined，
+ * 避免把空字符串当作有效的会话名存入设置。
+ *
+ * @param value - 用户输入的原始会话名
+ * @returns 去除空白后的名字，输入为空/全空白时为 undefined
+ */
 export function normalizeSessionName(value: string): string | undefined {
 	const name = value.trim();
 	return name.length > 0 ? name : undefined;
 }
 
+/**
+ * 解析命令行参数，产出结构化的 {@link Args}。
+ *
+ * 之所以手写逐 token 解析而不用通用解析库：需要把「未识别的长选项」原样
+ * 收进 `unknownFlags` 交给扩展系统认领（扩展可注册如 --plan 这类 flag），
+ * 通用库通常会把未知选项直接判为致命错误。
+ *
+ * 解析全程不抛异常：可恢复的问题（非法枚举值、选项缺值、未知短选项）
+ * 一律记入 `diagnostics`，由上层统一呈现，保证解析总能得到完整结果。
+ *
+ * @param args - 待解析的参数数组（通常是 process.argv.slice(2)）
+ * @returns 解析结果；问题细节见其 diagnostics 字段
+ */
 export function parseArgs(args: string[]): Args {
+	// 收集型字段先初始化；其余字段保持 undefined 表示「未指定」
 	const result: Args = {
 		messages: [],
 		fileArgs: [],
@@ -76,10 +137,12 @@ export function parseArgs(args: string[]): Args {
 		diagnostics: [],
 	};
 
+	// ===== 逐 token 解析主循环：i 手动前移以吞掉选项携带的值 =====
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
 
 		if (arg === "--") {
+			// `--` 之后的 token 不再当作选项解析，仅按 @ 前缀区分文件与消息
 			for (const positionalArg of args.slice(i + 1)) {
 				if (positionalArg.startsWith("@")) {
 					result.fileArgs.push(positionalArg.slice(1));
@@ -94,6 +157,7 @@ export function parseArgs(args: string[]): Args {
 			result.version = true;
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
+			// 非法取值静默忽略，保持默认 text 模式
 			if (mode === "text" || mode === "json" || mode === "rpc") {
 				result.mode = mode;
 			}
@@ -149,6 +213,7 @@ export function parseArgs(args: string[]): Args {
 			if (isValidThinkingLevel(level)) {
 				result.thinking = level;
 			} else {
+				// 非法级别只记 warning 不中断解析，让启动继续用默认思考级别
 				result.diagnostics.push({
 					type: "warning",
 					message: `Invalid thinking level "${level}". Valid values: ${VALID_THINKING_LEVELS.join(", ")}`,
@@ -156,6 +221,8 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
+			// -p 支持内联 prompt：下一个 token 若不像选项/文件参数就当作 prompt 消费。
+			// 以 --- 开头的 token 也视为消息而非 flag，以兼容以连字符开头的 prompt
 			const next = args[i + 1];
 			if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---"))) {
 				result.messages.push(next);
@@ -194,7 +261,7 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--no-context-files" || arg === "-nc") {
 			result.noContextFiles = true;
 		} else if (arg === "--list-models") {
-			// Check if next arg is a search pattern (not a flag or file arg)
+			// 检查下一个参数是否为搜索模式（不是 flag、也不是 @ 文件参数）
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
 				result.listModels = args[++i];
 			} else {
@@ -223,12 +290,17 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--offline") {
 			result.offline = true;
 		} else if (arg.startsWith("@")) {
-			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
+			result.fileArgs.push(arg.slice(1)); // 去掉 @ 前缀
 		} else if (arg.startsWith("--")) {
+			// 未识别的长选项不报错：收集进 unknownFlags 交给扩展系统认领，
+			// 同时兼容 --flag=value 与 --flag value 两种写法
 			const eqIndex = arg.indexOf("=");
 			if (eqIndex !== -1) {
+				// 等号形式：= 之后的整体作为值，即使其中再含 = 也不再拆分
 				result.unknownFlags.set(arg.slice(2, eqIndex), arg.slice(eqIndex + 1));
 			} else {
+				// 启发式判断下一个 token 是否为该 flag 的值：
+				// 以 - 开头（其他选项）或 @ 开头（文件参数）则不吞掉，记为布尔 true
 				const flagName = arg.slice(2);
 				const next = args[i + 1];
 				if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
@@ -239,8 +311,10 @@ export function parseArgs(args: string[]): Args {
 				}
 			}
 		} else if (arg.startsWith("-") && !arg.startsWith("--")) {
+			// 单短横线的短选项没有扩展认领机制，未识别即记为错误
 			result.diagnostics.push({ type: "error", message: `Unknown option: ${arg}` });
 		} else if (!arg.startsWith("-")) {
+			// 既非选项也非 @ 文件的位置参数：视为消息文本
 			result.messages.push(arg);
 		}
 	}
@@ -248,7 +322,16 @@ export function parseArgs(args: string[]): Args {
 	return result;
 }
 
+/**
+ * 打印 CLI 帮助文本到 stdout。
+ *
+ * 帮助主体为固定模板（用法、子命令、选项表、示例、环境变量等）；
+ * 若扩展注册了自定义 flag，则在其后追加「Extension CLI Flags」段落。
+ *
+ * @param extensionFlags - 扩展注册的 CLI flag 列表（可选；为空时不追加扩展段落）
+ */
 export function printHelp(extensionFlags?: ExtensionFlag[]): void {
+	// 扩展 flag 段落：flag 列 padEnd(30) 对齐，与主选项表列宽一致；无扩展 flag 时为空串
 	const extensionFlagsText =
 		extensionFlags && extensionFlags.length > 0
 			? `\n${chalk.bold("Extension CLI Flags:")}\n${extensionFlags

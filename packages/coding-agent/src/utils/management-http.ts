@@ -1,28 +1,41 @@
+/**
+ * @file management-http.ts —— 管理类 HTTP 请求的 fetch 封装（带有限重试与超时）
+ *
+ * @description
+ * 面向幂等的管理请求（版本检查、目录、下载）提供传输层辅助 `fetchWithRetry`：
+ * 对瞬时网络错误与可重试状态码做有界重试，并区分「总超时」与「单次尝试超时」。
+ */
+
 type FetchInput = Parameters<typeof fetch>[0];
 
+/** 视为瞬时故障、可安全重试的 HTTP 状态码集合。 */
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+/** fetchWithRetry 的重试与超时选项。 */
 export interface FetchRetryOptions {
-	/** Number of additional attempts after the initial request. Defaults to two. */
+	/** 首次请求之外额外的重试次数。默认为 2。 */
 	maxRetries?: number;
-	/** Retry transient HTTP responses as well as transport failures. Defaults to true. */
+	/** 除传输失败外，是否也对瞬时 HTTP 状态码重试。默认为 true。 */
 	retryOnStatus?: boolean;
-	/** Overall time budget shared by all attempts. */
+	/** 所有尝试共享的总时间预算。 */
 	timeoutMs?: number;
-	/** Per-attempt timeout. A new timeout is created for every attempt. */
+	/** 单次尝试的超时。每次尝试都会新建一个超时计时。 */
 	attemptTimeoutMs?: number;
 }
 
 /**
- * Fetch a management HTTP resource with a bounded immediate retry.
+ * 抓取管理类 HTTP 资源，带有限次数的立即重试。
  *
- * This is intentionally a transport-level helper for idempotent management
- * requests (version checks, catalogs, and downloads). It must not be used for
- * agent/model operations: those can fail after the HTTP request starts and are
- * retried by their semantic caller instead.
+ * 这是有意为之的传输层辅助函数，仅用于幂等的管理请求
+ * （版本检查、目录、下载）。不得用于 agent/模型操作：
+ * 那类请求可能在 HTTP 请求开始后才失败，应由其语义层调用方负责重试。
  *
- * Caller cancellation and timeoutMs are terminal. attemptTimeoutMs aborts
- * only the current attempt so a hung connection can be retried.
+ * 调用方取消与 timeoutMs 是终态（直接抛错不再重试）。attemptTimeoutMs
+ * 只中止当前这一次尝试，因此挂死的连接可以被重试。
+ *
+ * @param input - 请求 URL（或 Request 对象）
+ * @param init - 透传给 fetch 的初始化参数
+ * @param options - 重试与超时选项
  */
 export async function fetchWithRetry(
 	input: FetchInput,
@@ -43,6 +56,7 @@ export async function fetchWithRetry(
 	for (let attempt = 0; ; attempt++) {
 		parentSignal?.throwIfAborted();
 		timeoutSignal?.throwIfAborted();
+		// 每次尝试新建单次超时信号，并与父信号、总超时信号合并为任一触发即中止
 		const attemptTimeoutSignal = attemptTimeoutMs ? AbortSignal.timeout(attemptTimeoutMs) : undefined;
 		const signals = [parentSignal, timeoutSignal, attemptTimeoutSignal].filter(
 			(signal): signal is AbortSignal => signal !== undefined,
@@ -56,10 +70,10 @@ export async function fetchWithRetry(
 			try {
 				await response.body?.cancel();
 			} catch {
-				// The response is being discarded before a retry. There is nothing useful to
-				// do if cancelling its body also fails.
+				// 响应即将在重试前被丢弃；取消其 body 若也失败，无需再做任何处理。
 			}
 		} catch (error) {
+			// 区分「仅单次尝试超时」（可重试）与其他中止/失败（终态）
 			const attemptTimedOut =
 				attemptTimeoutSignal?.aborted === true && !parentSignal?.aborted && !timeoutSignal?.aborted;
 			if (

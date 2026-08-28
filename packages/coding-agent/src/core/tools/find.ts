@@ -1,3 +1,31 @@
+/**
+ * @file find.ts —— find 文件查找工具（基于 fd）
+ *
+ * @description
+ * 实现 coding-agent 的 `find` 工具：按 glob 模式（如 '*.ts'、'src/**\/*.spec.ts'）
+ * 查找文件，返回相对搜索目录的路径列表。遵循 .gitignore 规则，默认最多
+ * 返回 1000 条结果，超限时提示加大 limit 或收窄 pattern。
+ *
+ * 主要功能点：
+ * - 通过 `ensureTool("fd")` 保证 fd 可用（本地缺失时自动下载），以 --glob
+ *   模式 spawn 子进程并逐行收集结果；
+ * - 两条执行路径：注入自定义 operations.glob 时走自定义后端（可对接远程
+ *   系统），否则走本地 fd 子进程；
+ * - 模式修正：含 "/" 的 pattern 自动切换 --full-path 并补 "**\/" 前缀；
+ *   Windows 上再把 "/" 放宽为 [/\\] 以兼容原生分隔符；
+ * - 结果相对化：统一转为相对搜索根目录的 posix 风格路径，保证输出稳定；
+ * - 输出双重截断保护：结果数上限 + 总字节数上限，截断原因写入 details
+ *   供 UI 渲染警告。
+ *
+ * 沙箱化设计：与 grep 相同，工具定义与 IO（FindOperations）分离，
+ * 默认实现走本地文件系统 + fd。
+ *
+ * 依赖关系：
+ * - `./path-utils.ts`：路径存在性检查与 cwd 解析；
+ * - `./truncate.ts`：字节截断工具与常量；
+ * - `../../utils/tools-manager.ts`：fd 的查找与按需下载；
+ * - `./render-utils.ts` / `../../modes/interactive/theme`：TUI 渲染辅助与配色。
+ */
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
@@ -13,19 +41,30 @@ import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
 
-/** Relativize a find result against the search root and normalize it to posix separators. */
+/**
+ * 把 find 结果路径相对化到搜索根目录，并统一为 posix 分隔符（"/"）。
+ * 绝对路径转为相对路径；相对路径原样保留；结尾分隔符（目录标记）会被还原，
+ * 避免相对化过程中丢失「这是一个目录」的信息。
+ *
+ * @param resultPath - 待处理的匹配路径，绝对或相对均可
+ * @param searchPath - 搜索根目录（绝对路径）
+ * @param pathModule - 可注入的 path 实现（默认 node:path），便于测试平台特定行为
+ */
 export function relativizeFindResultPath(
 	resultPath: string,
 	searchPath: string,
 	pathModule: path.PlatformPath = path,
 ): string {
+	// 记录结尾是否带分隔符（Windows 下输入里 / 和 \ 都可能出现）
 	const hadTrailingSeparator =
 		resultPath.endsWith(pathModule.sep) || (pathModule.sep === "\\" && resultPath.endsWith("/"));
+	// 仅绝对路径需要 relative()；随后把平台分隔符统一成 "/"
 	const relativePath = pathModule.isAbsolute(resultPath) ? pathModule.relative(searchPath, resultPath) : resultPath;
 	const posixPath = relativePath.split(pathModule.sep).join("/");
 	return hadTrailingSeparator && !posixPath.endsWith("/") ? `${posixPath}/` : posixPath;
 }
 
+/** find 工具的输入参数 schema（typebox 定义），同时用于入参校验与生成 LLM 可见的参数描述 */
 const findSchema = Type.Object({
 	pattern: Type.String({
 		description: "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'",
@@ -34,42 +73,57 @@ const findSchema = Type.Object({
 	limit: Type.Optional(Type.Number({ description: "Maximum number of results (default: 1000)" })),
 });
 
+/** 注入到系统提示词的 find 工具简介片段（snippet 一句话，guidelines 预留为空） */
 export const findToolSystemPromptContribution = {
 	snippet: "Find files by glob pattern (respects .gitignore)",
 	guidelines: [],
 } as const;
 
+/** 由 schema 推导出的 find 工具入参类型 */
 export type FindToolInput = Static<typeof findSchema>;
 
+/** 未显式指定 limit 时的默认最大结果数（比 grep 宽：单行路径很短） */
 const DEFAULT_LIMIT = 1000;
 
+/**
+ * find 工具结果附带的元数据（不进入模型可见文本，仅供 UI 渲染截断警告）。
+ */
 export interface FindToolDetails {
+	/** 输出因总字节数超限被截断时的详细信息 */
 	truncation?: TruncationResult;
+	/** 结果数达到 limit 上限时记录该上限值 */
 	resultLimitReached?: number;
 }
 
 /**
- * Pluggable operations for the find tool.
- * Override these to delegate file search to remote systems (for example SSH).
+ * find 工具的可插拔 IO 操作集合（沙箱化边界）。
+ * 覆盖这些方法即可把文件查找委托给远程系统（例如 SSH），
+ * 而不必改动工具本身的路径修正与截断逻辑。
  */
 export interface FindOperations {
-	/** Check if path exists */
+	/** 判断路径是否存在 */
 	exists: (absolutePath: string) => Promise<boolean> | boolean;
-	/** Find files matching glob pattern. Returns relative or absolute paths. */
+	/** 按 glob 模式查找文件，返回相对或绝对路径 */
 	glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) => Promise<string[]> | string[];
 }
 
+/** 默认 operations：本地文件系统。glob() 只是占位——未注入自定义 glob 时，execute() 里直接跑 fd。 */
 const defaultFindOperations: FindOperations = {
 	exists: pathExists,
-	// This is a placeholder. Actual fd execution happens in execute() when no custom glob is provided.
+	// 占位实现。真正的 fd 执行发生在 execute() 中（未提供自定义 glob 时）。
 	glob: () => [],
 };
 
+/** createFindToolDefinition 的可选项 */
 export interface FindToolOptions {
-	/** Custom operations for find. Default: local filesystem plus fd */
+	/** 自定义 IO 操作。默认：本地文件系统 + fd */
 	operations?: FindOperations;
 }
 
+/**
+ * 格式化 find 工具调用在 TUI 中的显示行：`find pattern in path (limit N)`。
+ * 参数缺失或非法时以 invalidArg 占位。
+ */
 function formatFindCall(args: { pattern: string; path?: string; limit?: number } | undefined, theme: Theme): string {
 	const pattern = str(args?.pattern);
 	const rawPath = str(args?.path);
@@ -87,6 +141,10 @@ function formatFindCall(args: { pattern: string; path?: string; limit?: number }
 	return text;
 }
 
+/**
+ * 格式化 find 工具结果在 TUI 中的显示：默认最多展示 20 行，超出部分提示
+ * 可用展开快捷键查看全部；再根据 details 中的截断信息追加警告行。
+ */
 function formatFindResult(
 	result: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
@@ -109,6 +167,7 @@ function formatFindResult(
 		}
 	}
 
+	// ===== 截断警告：根据 details 中的截断原因拼出提示行 =====
 	const resultLimit = result.details?.resultLimitReached;
 	const truncation = result.details?.truncation;
 	if (resultLimit || truncation?.truncated) {
@@ -120,6 +179,16 @@ function formatFindResult(
 	return text;
 }
 
+/**
+ * 创建 find 工具定义（ToolDefinition），包含 execute 执行逻辑与 TUI 渲染两部分。
+ *
+ * 工作原理：优先使用注入的 operations.glob（自定义后端）；否则 spawn fd
+ * 子进程（--glob 模式）逐行收集结果。两条路径的结果都经
+ * relativizeFindResultPath 相对化后输出，并做结果数上限 + 字节数双重截断。
+ *
+ * @param cwd - 工作目录，相对的 path 参数会解析到该目录下
+ * @param options - 可选自定义 operations（默认本地文件系统 + fd）
+ */
 export function createFindToolDefinition(
 	cwd: string,
 	options?: FindToolOptions,
@@ -138,6 +207,7 @@ export function createFindToolDefinition(
 			_onUpdate?,
 			_ctx?,
 		) {
+			// 整个执行包装为 Promise：settle() 保证 resolve/reject 只触发一次，并同步摘除 abort 监听
 			return new Promise((resolve, reject) => {
 				if (signal?.aborted) {
 					reject(new Error("Operation aborted"));
@@ -145,6 +215,7 @@ export function createFindToolDefinition(
 				}
 
 				let settled = false;
+				// 由 fd 执行路径赋值：abort 时用来杀掉子进程
 				let stopChild: (() => void) | undefined;
 				const settle = (fn: () => void) => {
 					if (settled) return;
@@ -161,11 +232,12 @@ export function createFindToolDefinition(
 
 				(async () => {
 					try {
+						// 把用户给的 path（缺省 "."）解析为基于 cwd 的绝对路径
 						const searchPath = resolveToCwd(searchDir || ".", cwd);
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 						const ops = customOps ?? defaultFindOperations;
 
-						// If custom operations provide glob(), use that instead of fd.
+						// ===== 路径一：自定义 operations 提供了 glob() 时，走自定义后端而非 fd =====
 						if (customOps?.glob) {
 							if (!(await ops.exists(searchPath))) {
 								settle(() => reject(new Error(`Path not found: ${searchPath}`)));
@@ -175,6 +247,7 @@ export function createFindToolDefinition(
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
+							// 忽略 node_modules 与 .git，与 fd 默认行为保持一致
 							const results = await ops.glob(pattern, searchPath, {
 								ignore: ["**/node_modules/**", "**/.git/**"],
 								limit: effectiveLimit,
@@ -193,7 +266,7 @@ export function createFindToolDefinition(
 								return;
 							}
 
-							// Relativize paths against the search root for stable output.
+							// 结果相对化到搜索根目录，保证输出稳定。
 							const relativized = results.map((p) => relativizeFindResultPath(p, searchPath));
 							const resultLimitReached = relativized.length >= effectiveLimit;
 							const rawOutput = relativized.join("\n");
@@ -221,7 +294,7 @@ export function createFindToolDefinition(
 							return;
 						}
 
-						// Default implementation uses fd.
+						// ===== 路径二：默认实现，spawn fd 子进程 =====
 						const fdPath = await ensureTool("fd");
 						if (signal?.aborted) {
 							settle(() => reject(new Error("Operation aborted")));
@@ -234,10 +307,11 @@ export function createFindToolDefinition(
 
 						const args: string[] = ["--glob", "--color=never", "--hidden"];
 
-						// fd normally ignores .gitignore outside git repos, so keep --no-require-git
-						// there. Inside repos, use fd's default git-aware behavior so parent
-						// .gitignore rules stop at nested repo boundaries:
+						// fd 在 git 仓库之外默认忽略 .gitignore，因此该场景需要 --no-require-git
+						// 让其生效。仓库内则保持 fd 默认的 git 感知行为，使父级 .gitignore
+						// 规则在嵌套仓库边界处停止作用：
 						// https://github.com/earendil-works/pi/issues/5960
+						// 自底向上逐级查找 .git，判断搜索路径是否位于某个 git 仓库内
 						let insideGitRepo = false;
 						for (let current = searchPath; ; ) {
 							if (await pathExists(path.join(current, ".git"))) {
@@ -251,26 +325,28 @@ export function createFindToolDefinition(
 						if (!insideGitRepo) args.push("--no-require-git");
 						args.push("--max-results", String(effectiveLimit));
 
-						// fd --glob matches against the basename unless --full-path is set; in --full-path
-						// mode it matches against the absolute candidate path, so a path-containing
-						// pattern like 'src/**/*.spec.ts' needs a leading '**/' to match anything.
+						// fd --glob 默认只对文件名（basename）做匹配，设置 --full-path 后才匹配
+						// 完整路径；此时像 'src/**\/*.spec.ts' 这类含路径的 pattern 必须补上
+						// 前缀 '**\/' 才能匹配到任何结果。
 						let effectivePattern = pattern;
 						if (pattern.includes("/")) {
 							args.push("--full-path");
 							if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") {
 								effectivePattern = `**/${pattern}`;
 							}
-							// fd matches full paths using native separators on Windows.
+							// Windows 上 fd 用原生分隔符匹配完整路径，故把 "/" 放宽为 [/\\]。
 							if (process.platform === "win32")
 								effectivePattern = effectivePattern.replaceAll("/", String.raw`[/\\]`);
 						}
 						args.push("--", effectivePattern, searchPath);
 
+						// ===== 执行 fd 并逐行收集输出 =====
 						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						const lines: string[] = [];
 
+						// 供 onAbort 使用的停止函数：杀掉 fd 子进程
 						stopChild = () => {
 							if (!child.killed) {
 								child.kill();
@@ -294,6 +370,7 @@ export function createFindToolDefinition(
 							settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
 						});
 
+						// fd 非零退出且无任何输出时视为错误；已有部分输出则继续走正常返回流程
 						child.on("close", (code) => {
 							cleanup();
 							if (signal?.aborted) {
@@ -318,6 +395,7 @@ export function createFindToolDefinition(
 								return;
 							}
 
+							// 去掉行尾 \r、跳过空行后统一相对化
 							const relativized: string[] = [];
 							for (const rawLine of lines) {
 								const line = rawLine.replace(/\r$/, "").trim();
@@ -362,6 +440,7 @@ export function createFindToolDefinition(
 				})();
 			});
 		},
+		// TUI：复用上次渲染的 Text 组件原地更新，避免闪烁
 		renderCall(args, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			text.setText(formatFindCall(args, theme));
@@ -375,6 +454,11 @@ export function createFindToolDefinition(
 	};
 }
 
+/**
+ * 创建可直接注册到 AgentContext 的 find AgentTool（对 ToolDefinition 的薄包装）。
+ * @param cwd - 工作目录
+ * @param options - 可选自定义 operations
+ */
 export function createFindTool(cwd: string, options?: FindToolOptions): AgentTool<typeof findSchema> {
 	return wrapToolDefinition(createFindToolDefinition(cwd, options));
 }

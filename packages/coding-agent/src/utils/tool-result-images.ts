@@ -1,23 +1,37 @@
+/**
+ * @file tool-result-images.ts —— 工具返回图片的入历史前归一化
+ *
+ * @description
+ * 对工具结果中的 image 块统一跑一遍 `processImage`（格式归一 + 超限缩放），
+ * 防止扩展 / MCP / 截图等工具直接产出的超大 base64 图片进入会话历史后
+ * 被供应商拒绝整段对话。
+ */
+
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { processImage } from "./image-process.ts";
 
+/** 工具结果内容块：文本或图片。 */
 export type ToolResultContent = TextContent | ImageContent;
 
+/** 归一化选项。 */
 export interface NormalizeToolResultImagesOptions {
-	/** Whether oversized images are resized to inline provider limits. Default: true */
+	/** 是否把超限图片缩放到内联（inline）图片的供应商限制以内。默认：true */
 	autoResizeImages?: boolean;
 }
 
 /**
- * Normalize image blocks returned by tool results.
+ * 归一化工具结果中的 image 块。
  *
- * The `read` tool and `@file` CLI attachments run their images through `processImage`, but tools
- * that produce images themselves (extensions, MCP bridges, screenshot tools) hand back arbitrary
- * base64 payloads that go straight into session history and every subsequent provider request.
- * Oversized images make the provider reject the whole conversation, not just the offending turn,
- * so normalize them once as they enter history.
+ * `read` 工具与 `@file` 附件的图片已经过 `processImage` 处理，但自行产出图片的工具
+ * （扩展、MCP 桥接、截图工具）会返回任意的 base64 数据，直接进入会话历史以及
+ * 之后的每一次供应商请求。超大图片会导致供应商拒绝整个对话而不只是出问题的那一轮，
+ * 因此在图片进入历史时统一归一化一次。
  *
- * Returns the original array when nothing changed so callers can skip rewriting the result.
+ * 没有任何变化时返回原数组，调用方可以跳过对结果的改写。
+ *
+ * @param content - 工具结果内容块数组
+ * @param options - 归一化选项
+ * @returns 归一化后的内容块数组；无变化时原样返回
  */
 export async function normalizeToolResultImages(
 	content: ToolResultContent[],
@@ -39,9 +53,8 @@ export async function normalizeToolResultImages(
 
 		const processed = await processImage(Buffer.from(block.data, "base64"), block.mimeType, { autoResizeImages });
 		if (!processed.ok) {
-			// Unlike `read`, keep the original block. The tool already produced this image and the
-			// failure may just be an unavailable image backend, so passing it through preserves the
-			// behavior tools have today instead of silently deleting their output.
+			// 与 `read` 不同，这里保留原始块：图片是工具已经产出的内容，失败可能只是
+			// 图片后端不可用，原样透传可维持工具现有的行为，而不是悄悄丢弃其输出。
 			normalized.push(block);
 			continue;
 		}

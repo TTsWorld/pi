@@ -1,3 +1,23 @@
+/**
+ * @file index.ts —— 内置工具集的统一出口与工厂
+ *
+ * @description
+ * 本文件做两件事：
+ * 1. 再导出各工具模块（bash / edit / find / grep / ls / powershell / read /
+ *    write）的工厂函数与类型，作为 tools 目录的统一入口；
+ * 2. 提供按名创建单个或成组工具的工厂：createTool / createCodingTools 等
+ *    返回可执行实例（Tool），createToolDefinition 等仅返回元信息定义
+ *    （ToolDef，含名称/描述/schema，不含执行逻辑）。
+ *
+ * definition 与执行（Operations）分离是刻意设计：定义可先发给 LLM 做参数
+ * 生成，实际执行时再注入本地或沙箱化的 Operations，便于安全隔离。
+ *
+ * 依赖关系：
+ * - `@earendil-works/pi-agent-core`：AgentTool 工具接口；
+ * - `../extensions/types.ts`：ToolDefinition 定义；
+ * - `./bash.ts` 等各工具模块：具体实现。
+ */
+
 export {
 	type BashOperations,
 	type BashSpawnContext,
@@ -90,9 +110,15 @@ import { createPowerShellTool, createPowerShellToolDefinition, type PowerShellTo
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
 
+// ===== 通用类型 =====
+
+/** 可执行工具实例：含 execute 执行逻辑，直接交给 Agent 循环调用 */
 export type Tool = AgentTool<any>;
+/** 工具定义：仅含名称/描述/参数 schema 等元信息，不含执行逻辑 */
 export type ToolDef = ToolDefinition<any, any>;
+/** 内置工具名的字面量联合类型 */
 export type ToolName = "read" | "bash" | "powershell" | "edit" | "write" | "grep" | "find" | "ls";
+/** 全部内置工具名的集合，供遍历与名字合法性校验使用 */
 export const allToolNames: Set<ToolName> = new Set([
 	"read",
 	"bash",
@@ -104,6 +130,7 @@ export const allToolNames: Set<ToolName> = new Set([
 	"ls",
 ]);
 
+/** 按工具名组织的各工具选项；未提供的项由各工具使用自身默认配置 */
 export interface ToolsOptions {
 	read?: ReadToolOptions;
 	bash?: BashToolOptions;
@@ -115,6 +142,11 @@ export interface ToolsOptions {
 	ls?: LsToolOptions;
 }
 
+/**
+ * 按工具名创建单个工具定义（ToolDef，仅元信息，不含执行逻辑）。
+ * 适合只向 LLM 声明工具、执行时再另行注入 Operations 的场景（如沙箱执行）。
+ * 未知工具名直接抛错。
+ */
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
 	switch (toolName) {
 		case "read":
@@ -138,6 +170,10 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 	}
 }
 
+/**
+ * 按工具名创建单个可执行工具实例（Tool）。
+ * 与 {@link createToolDefinition} 对应的实例版本；未知工具名直接抛错。
+ */
 export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptions): Tool {
 	switch (toolName) {
 		case "read":
@@ -161,6 +197,12 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 	}
 }
 
+// ===== 成组工厂 =====
+
+/**
+ * 核心编码工具定义集：read / bash / edit / write（不含只读检索类与 PowerShell）。
+ * 与 {@link createCodingTools} 一一对应的定义版本。
+ */
 export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
 	return [
 		createReadToolDefinition(cwd, options?.read),
@@ -170,6 +212,10 @@ export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions)
 	];
 }
 
+/**
+ * 只读工具定义集：read / grep / find / ls。
+ * 用于只允许查看、不允许改动文件的场景（如只读审查模式）。
+ */
 export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
 	return [
 		createReadToolDefinition(cwd, options?.read),
@@ -179,6 +225,7 @@ export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOption
 	];
 }
 
+/** 创建全部 8 个内置工具的定义，以工具名为键，便于按名取用 */
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
 	return {
 		read: createReadToolDefinition(cwd, options?.read),
@@ -192,6 +239,10 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 	};
 }
 
+/**
+ * 核心编码可执行工具集（read / bash / edit / write），
+ * 与 {@link createCodingToolDefinitions} 一一对应的实例版本。
+ */
 export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 	return [
 		createReadTool(cwd, options?.read),
@@ -201,6 +252,10 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 	];
 }
 
+/**
+ * 只读可执行工具集（read / grep / find / ls），
+ * 与 {@link createReadOnlyToolDefinitions} 一一对应的实例版本。
+ */
 export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[] {
 	return [
 		createReadTool(cwd, options?.read),
@@ -210,6 +265,7 @@ export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[]
 	];
 }
 
+/** 创建全部 8 个内置工具的可执行实例，以工具名为键 */
 export function createAllTools(cwd: string, options?: ToolsOptions): Record<ToolName, Tool> {
 	return {
 		read: createReadTool(cwd, options?.read),

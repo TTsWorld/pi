@@ -1,21 +1,39 @@
+/**
+ * @file slash-commands.ts —— slash 命令的定义与元数据
+ *
+ * @description
+ * 描述 slash 命令的来源类型（扩展 / prompt / skill）与信息结构，
+ * 并集中列出 CLI 内建的 slash 命令清单，供输入补全与帮助展示使用。
+ */
 import { APP_NAME } from "../config.ts";
 import type { SourceInfo } from "./source-info.ts";
 
+/** slash 命令的来源：扩展注册 / prompt 文件 / skill */
 export type SlashCommandSource = "extension" | "prompt" | "skill";
 
+/** 一个 slash 命令的描述信息 */
 export interface SlashCommandInfo {
+	/** 命令名（不含斜杠前缀） */
 	name: string;
+	/** 展示用描述 */
 	description?: string;
+	/** 命令来源 */
 	source: SlashCommandSource;
+	/** 来源定位信息（文件路径等） */
 	sourceInfo: SourceInfo;
 }
 
+/** 内建 slash 命令的静态描述 */
 export interface BuiltinSlashCommand {
+	/** 命令名（不含斜杠前缀） */
 	name: string;
+	/** 展示用描述 */
 	description: string;
+	/** 参数提示（如 "<provider/model>"） */
 	argumentHint?: string;
 }
 
+/** 内建 slash 命令清单（补全与帮助界面共用） */
 export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
 	{ name: "model", description: "Select model (opens selector UI)", argumentHint: "<provider/model>" },
