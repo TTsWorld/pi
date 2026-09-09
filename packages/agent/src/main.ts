@@ -1,3 +1,24 @@
+/**
+ * @file pi-agent CLI 主入口
+ *
+ * @description
+ * pi monorepo agent 包的主流程编排文件。职责：定义命令行参数 → 解析参数 →
+ * 根据参数将程序分派到以下三种运行模式之一：
+ *
+ * 1. 交互 TUI 模式（默认，无位置参数且未开 --json）：
+ *    由 runTuiInteractiveMode 驱动，使用 TuiRenderer 渲染终端 UI，支持会话恢复。
+ * 2. JSON 交互模式（--json 且无位置参数）：
+ *    由 runJsonInteractiveMode 驱动，stdin 逐行读取 JSON 命令（message/interrupt），
+ *    输出 JSONL 事件流，便于被其他程序（如 IDE 插件、上层 agent）嵌入调用。
+ * 3. 单发模式（提供了位置参数消息）：
+ *    由 runSingleShotMode 驱动，依次处理每条消息后退出，适合脚本化调用。
+ *
+ * 依赖关系：
+ * - args.js：通用参数解析器（parseArgs / printHelp）
+ * - agent.js：Agent 核心循环（Agent 类与 AgentConfig 类型）
+ * - session-manager.js：会话持久化（SessionManager）
+ * - renderers/*：三种渲染器（ConsoleRenderer / JsonRenderer / TuiRenderer）
+ */
 import chalk from "chalk";
 import { createInterface } from "readline";
 import type { AgentConfig } from "./agent.js";
@@ -8,7 +29,7 @@ import { JsonRenderer } from "./renderers/json-renderer.js";
 import { TuiRenderer } from "./renderers/tui-renderer.js";
 import { SessionManager } from "./session-manager.js";
 
-// Define argument structure
+// 定义命令行参数结构
 const argDefs = {
 	"base-url": {
 		type: "string" as const,
@@ -56,11 +77,19 @@ const argDefs = {
 	},
 };
 
+/**
+ * JSON 交互模式下 stdin 输入命令的结构。
+ * - type 为 "message" 时必须携带 content 字符串（发给 agent 的用户消息）
+ * - type 为 "interrupt" 时中断当前正在处理的请求
+ */
 interface JsonCommand {
 	type: "message" | "interrupt";
 	content?: string;
 }
 
+/**
+ * 打印 CLI 帮助信息（用法说明 + 各参数说明）。
+ */
 function printHelp(): void {
 	const usage = `Usage: pi-agent [options] [messages...]
 
@@ -88,18 +117,35 @@ pi-agent --base-url https://api.anthropic.com/v1 --api-key $ANTHROPIC_API_KEY --
 	printHelpArgs(argDefs, usage);
 }
 
+/**
+ * JSON 交互模式：从 stdin 逐行读取 JSON 命令，驱动 agent 并输出 JSONL 事件流。
+ *
+ * 之所以单独提供这种模式，是为了让本 CLI 能被宿主程序（而非人类终端）以管道方式嵌入：
+ * 宿主逐行写入 `{"type":"message","content":"..."}` 或 `{"type":"interrupt"}`，
+ * 并从 stdout 逐行读取 JSONL 事件。
+ *
+ * @param config         agent 配置（API 地址、密钥、模型等）
+ * @param sessionManager 会话管理器，用于持久化与恢复会话
+ */
 async function runJsonInteractiveMode(config: AgentConfig, sessionManager: SessionManager): Promise<void> {
+	// terminal: false —— 不解释控制字符，因为 stdin 是管道输入而非真实终端
 	const rl = createInterface({
 		input: process.stdin,
 		output: process.stdout,
-		terminal: false, // Don't interpret control characters
+		terminal: false, // Don't interpret control characters（不解释控制字符）
 	});
 
 	const renderer = new JsonRenderer();
 	const agent = new Agent(config, renderer, sessionManager);
+	// 串行化状态：同一时刻只允许一个 agent.ask 在跑
 	let isProcessing = false;
+	// 处理期间到达的新消息会暂存到这里，等当前请求结束后再继续处理
 	let pendingMessage: string | null = null;
 
+	/**
+	 * 向 agent 发送一条消息；处理期间若有新消息到达则排队，当前请求结束后自动续跑。
+	 * @param content 用户消息文本
+	 */
 	const processMessage = async (content: string): Promise<void> => {
 		isProcessing = true;
 
@@ -110,7 +156,9 @@ async function runJsonInteractiveMode(config: AgentConfig, sessionManager: Sessi
 		} finally {
 			isProcessing = false;
 
-			// Process any pending message
+			// ========== 处理排队消息 ==========
+			// Why：agent 同一时间只能处理一个请求；用 pendingMessage 单槽队列
+			// 保证「处理中到达的消息」不丢失，且始终串行执行，避免并发交错导致事件流错乱。
 			if (pendingMessage) {
 				const msg = pendingMessage;
 				pendingMessage = null;
@@ -119,13 +167,14 @@ async function runJsonInteractiveMode(config: AgentConfig, sessionManager: Sessi
 		}
 	};
 
-	// Listen for lines from stdin
+	// 监听 stdin 的每一行输入
 	rl.on("line", (line) => {
 		try {
 			const command = JSON.parse(line) as JsonCommand;
 
 			switch (command.type) {
 				case "interrupt":
+					// 中断当前请求，并复位处理标记（被中断的请求不会再走完 finally 之外的逻辑）
 					agent.interrupt();
 					isProcessing = false;
 					break;
@@ -137,7 +186,7 @@ async function runJsonInteractiveMode(config: AgentConfig, sessionManager: Sessi
 					}
 
 					if (isProcessing) {
-						// Queue the message for when the agent is done
+						// agent 忙碌时先入队，等当前请求完成后再处理
 						pendingMessage = command.content;
 					} else {
 						processMessage(command.content);
@@ -152,7 +201,7 @@ async function runJsonInteractiveMode(config: AgentConfig, sessionManager: Sessi
 		}
 	});
 
-	// Wait for stdin to close
+	// 等待 stdin 关闭（宿主关闭管道）后再返回，模式即结束
 	await new Promise<void>((resolve) => {
 		rl.on("close", () => {
 			resolve();
@@ -160,21 +209,36 @@ async function runJsonInteractiveMode(config: AgentConfig, sessionManager: Sessi
 	});
 }
 
+/**
+ * 交互 TUI 模式：面向人类用户的终端 UI 聊天循环。
+ *
+ * 流程：初始化 TuiRenderer → 恢复历史会话事件并重放 → 进入「读输入 → ask」无限循环。
+ *
+ * @param agentConfig    agent 配置（API 地址、密钥、模型等）
+ * @param sessionManager 会话管理器，用于持久化与恢复会话
+ */
 async function runTuiInteractiveMode(agentConfig: AgentConfig, sessionManager: SessionManager): Promise<void> {
+	// ========== 恢复会话并提示 ==========
+	// 若有可恢复的会话（--continue），先告知用户将恢复多少条事件
 	const sessionData = sessionManager.getSessionData();
 	if (sessionData) {
 		console.log(chalk.dim(`Resuming session with ${sessionData.events.length} events`));
 	}
 	const renderer = new TuiRenderer();
 
-	// Initialize TUI BEFORE creating the agent to prevent double init
+	// 必须在创建 Agent 之前初始化 TUI，以防止重复初始化
 	await renderer.init();
 
 	const agent = new Agent(agentConfig, renderer, sessionManager);
+	// 注册中断回调：TUI 里用户按下中断键（如 Esc/Ctrl+C）时打断 agent
 	renderer.setInterruptCallback(() => {
 		agent.interrupt();
 	});
 
+	// ========== 重放历史事件 ==========
+	// Why：恢复会话时不仅要恢复 agent 内部状态（setEvents 重建上下文），
+	// 还要把历史事件重新渲染一遍，让 TUI 上“回放”出之前的对话内容。
+	// assistant_start 事件只需画标签头，其余事件走正常渲染路径。
 	if (sessionData) {
 		agent.setEvents(sessionData ? sessionData.events.map((e) => e.event) : []);
 		for (const sessionEvent of sessionData.events) {
@@ -187,6 +251,8 @@ async function runTuiInteractiveMode(agentConfig: AgentConfig, sessionManager: S
 		}
 	}
 
+	// ========== 主循环 ==========
+	// 读取用户输入 → 发给 agent；单条失败只报错不退出，会话可持续
 	while (true) {
 		const userInput = await renderer.getUserInput();
 		try {
@@ -197,6 +263,14 @@ async function runTuiInteractiveMode(agentConfig: AgentConfig, sessionManager: S
 	}
 }
 
+/**
+ * 单发模式：顺序处理完所有位置参数消息后退出，适合脚本化一次性调用。
+ *
+ * @param agentConfig    agent 配置（API 地址、密钥、模型等）
+ * @param sessionManager 会话管理器，用于持久化与恢复会话
+ * @param messages       命令行位置参数中的消息列表，按顺序逐条处理
+ * @param jsonOutput     是否以 JSONL 输出（决定用 JsonRenderer 还是 ConsoleRenderer）
+ */
 async function runSingleShotMode(
 	agentConfig: AgentConfig,
 	sessionManager: SessionManager,
@@ -207,12 +281,16 @@ async function runSingleShotMode(
 	const renderer = jsonOutput ? new JsonRenderer() : new ConsoleRenderer();
 	const agent = new Agent(agentConfig, renderer, sessionManager);
 	if (sessionData) {
+		// 恢复提示只打印给人类看；JSON 输出模式混入杂音会破坏下游解析
 		if (!jsonOutput) {
 			console.log(chalk.dim(`Resuming session with ${sessionData.events.length} events`));
 		}
 		agent.setEvents(sessionData ? sessionData.events.map((e) => e.event) : []);
 	}
 
+	// ========== 顺序处理消息 ==========
+	// Why：消息之间存在依赖（后一条可能引用前一条的回答），必须串行；
+	// 单条失败只输出错误事件并继续，保证批量消息尽量全部执行完。
 	for (const msg of messages) {
 		try {
 			await agent.ask(msg);
@@ -222,18 +300,25 @@ async function runSingleShotMode(
 	}
 }
 
-// Main function to use Agent as standalone CLI
+/**
+ * 主函数：将 Agent 作为独立 CLI 使用时的完整入口。
+ *
+ * 编排流程：解析参数 → 校验 → 决定运行模式 → 分派到对应的模式函数。
+ *
+ * @param args 命令行参数数组（不含 node 与脚本路径）
+ */
 export async function main(args: string[]): Promise<void> {
-	// Parse arguments
+	// 解析参数
 	const parsed = parseArgs(argDefs, args);
 
-	// Show help if requested
+	// 若请求了帮助信息（-h/--help）则打印并退出
 	if (parsed.help) {
 		printHelp();
 		return;
 	}
 
-	// Extract configuration from parsed args
+	// ========== 提取配置 ==========
+	// 从解析结果中取出各配置项
 	const baseURL = parsed["base-url"];
 	const apiKey = parsed["api-key"];
 	const model = parsed.model;
@@ -241,19 +326,19 @@ export async function main(args: string[]): Promise<void> {
 	const api = parsed.api as "completions" | "responses";
 	const systemPrompt = parsed["system-prompt"];
 	const jsonOutput = parsed.json;
-	const messages = parsed._; // Positional arguments
+	const messages = parsed._; // 位置参数（即要发送的消息列表）
 
 	if (!apiKey) {
 		throw new Error("API key required (use --api-key or set OPENAI_API_KEY)");
 	}
 
-	// Determine mode: interactive if no messages provided
+	// 决定模式：未提供消息则进入交互模式
 	const isInteractive = messages.length === 0;
 
-	// Create session manager
+	// 创建会话管理器
 	const sessionManager = new SessionManager(continueSession);
 
-	// Create or restore agent
+	// 创建或恢复 agent 配置
 	let agentConfig: AgentConfig = {
 		apiKey,
 		baseURL,
@@ -262,17 +347,21 @@ export async function main(args: string[]): Promise<void> {
 		systemPrompt,
 	};
 
+	// ========== 恢复会话配置 ==========
+	// Why：--continue 时优先沿用上次会话保存的配置（模型、base-url 等），
+	// 保证"接着聊"的行为与之前一致；只放行 apiKey 覆盖，方便换凭证续跑。
 	if (continueSession) {
 		const sessionData = sessionManager.getSessionData();
 		if (sessionData) {
 			agentConfig = {
 				...sessionData.config,
-				apiKey, // Allow overriding API key
+				apiKey, // 允许覆盖 API key
 			};
 		}
 	}
 
-	// Run in appropriate mode
+	// ========== 分派运行模式 ==========
+	// 交互（TUI / JSON 交互）或单发，见文件头说明
 	if (isInteractive) {
 		if (jsonOutput) {
 			await runJsonInteractiveMode(agentConfig, sessionManager);
